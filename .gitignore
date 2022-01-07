@@ -1,6 +1,7 @@
 # Custom ignored files
 *.ipynb
 test/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

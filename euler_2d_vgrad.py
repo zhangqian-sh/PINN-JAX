@@ -11,33 +11,33 @@ p = (gamma-1)*rho*e
 # %% import modules
 import numpy as np
 import jax.numpy as jnp
-from jax import jit, grad, vmap
+from jax import vjp, jit, grad
 from jax.example_libraries import optimizers
 
 from functools import partial
 import time
 import h5py
 
-import itertools
+import cProfile
 
 # %% initialization
-def glorot_normal(in_dim, out_dim):
+def xavier_init(in_dim, out_dim):
     glorot_stddev = np.sqrt(2.0 / (in_dim + out_dim))
     W = jnp.array(glorot_stddev * np.random.normal(size=(in_dim, out_dim)))
-    return W
+    b = jnp.zeros(out_dim)
+    return W, b
 
 
 def init_params(layers):
     params = []
     for i in range(len(layers) - 1):
         in_dim, out_dim = layers[i], layers[i + 1]
-        W = glorot_normal(in_dim, out_dim)
-        b = jnp.zeros(out_dim)
+        W, b = xavier_init(in_dim, out_dim)
         params.append({"W": W, "b": b})
     return params
 
 
-# %% functions for training
+# %% generic pinn function and vector gradient
 def pinn_generic(params, X_in):
     X = X_in
     for layer in params[:-1]:
@@ -46,11 +46,9 @@ def pinn_generic(params, X_in):
     return X
 
 
-def mini_batch(N: int, batch_size: int):
-    return np.split(
-        np.random.permutation(N),
-        np.arange(batch_size, N, batch_size),
-    )
+def vgrad(f, x):
+    y, vjp_fn = vjp(f, x)
+    return vjp_fn(jnp.ones(y.shape))[0]
 
 
 # %% define PINN model
@@ -61,15 +59,19 @@ class PINN:
         self.gamma = gamma
         self.opt_init, self.opt_update, self.get_params = optimizers.adam(1e-3)
         self.opt_state = self.opt_init(self.params)
-        self.global_step = itertools.count()
-        self.log_loss = []
 
     # forward pass
+    @partial(jit, static_argnums=(0,))
     def forward(self, params, X):
-        ruvp = pinn_generic(params, X)
-        return ruvp
+        # define functions
+        pinn = partial(pinn_generic, params)
+        f = lambda x: pinn(x)
+        # compute derivatives
+        rho, u, v, p = f(X)[:, 0], f(X)[:, 1], f(X)[:, 2], f(X)[:, 3]
+        return rho, u, v, p
 
     # residual
+    @partial(jit, static_argnums=(0,))
     def equation(self, params, X):
         """
         input = (t, x, y)
@@ -77,32 +79,32 @@ class PINN:
         u_t + f(u)_x + g(u)_y = 0
         """
         # define functions
-        pinn = lambda x: pinn_generic(params, x)
+        pinn = partial(pinn_generic, params)
         rho, u, v, p = (
-            lambda x: pinn(x)[0],
-            lambda x: pinn(x)[1],
-            lambda x: pinn(x)[2],
-            lambda x: pinn(x)[3],
+            lambda x: pinn(x)[:, 0],
+            lambda x: pinn(x)[:, 1],
+            lambda x: pinn(x)[:, 2],
+            lambda x: pinn(x)[:, 3],
         )
         rho_e = lambda x: p(x) / (self.gamma - 1)
         E = lambda x: 0.5 * rho(x) * (u(x) ** 2 + v(x) ** 2) + rho_e(x)
         # components
         # NOTE 1
-        u1_t = vmap(lambda x: grad(rho)(x)[0], (0))(X)
-        f1_x = vmap(lambda x: grad(lambda x: rho(x) * u(x))(x)[1], (0))(X)
-        g1_y = vmap(lambda x: grad(lambda x: rho(x) * v(x))(x)[2], (0))(X)
+        u1_t = (lambda x: vgrad(rho, x)[:, 0])(X)
+        f1_x = (lambda x: vgrad(lambda x: rho(x) * u(x), x)[:, 1])(X)
+        g1_y = (lambda x: vgrad(lambda x: rho(x) * v(x), x)[:, 2])(X)
         # NOTE 2
-        u2_t = vmap(lambda x: grad(lambda x: rho(x) * u(x))(x)[0], (0))(X)
-        f2_x = vmap(lambda x: grad(lambda x: rho(x) * u(x) ** 2 + p(x))(x)[1], (0))(X)
-        g2_y = vmap(lambda x: grad(lambda x: rho(x) * u(x) * v(x))(x)[2], (0))(X)
+        u2_t = (lambda x: vgrad(lambda x: rho(x) * u(x), x)[:, 0])(X)
+        f2_x = (lambda x: vgrad(lambda x: rho(x) * u(x) ** 2 + p(x), x)[:, 1])(X)
+        g2_y = (lambda x: vgrad(lambda x: rho(x) * u(x) * v(x), x)[:, 2])(X)
         # NOTE 3
-        u3_t = vmap(lambda x: grad(lambda x: rho(x) * v(x))(x)[0], (0))(X)
-        f3_x = vmap(lambda x: grad(lambda x: rho(x) * u(x) * v(x))(x)[1], (0))(X)
-        g3_y = vmap(lambda x: grad(lambda x: rho(x) * v(x) ** 2 + p(x))(x)[2], (0))(X)
+        u3_t = (lambda x: vgrad(lambda x: rho(x) * v(x), x)[:, 0])(X)
+        f3_x = (lambda x: vgrad(lambda x: rho(x) * u(x) * v(x), x)[:, 1])(X)
+        g3_y = (lambda x: vgrad(lambda x: rho(x) * v(x) ** 2 + p(x), x)[:, 2])(X)
         # NOTE 4
-        u4_t = vmap(lambda x: grad(E)(x)[0], (0))(X)
-        f4_x = vmap(lambda x: grad(lambda x: (E(x) + p(x)) * u(x))(x)[1], (0))(X)
-        g4_y = vmap(lambda x: grad(lambda x: (E(x) + p(x)) * v(x))(x)[2], (0))(X)
+        u4_t = (lambda x: vgrad(lambda x: E(x), x)[:, 0])(X)
+        f4_x = (lambda x: vgrad(lambda x: (E(x) + p(x)) * u(x), x)[:, 1])(X)
+        g4_y = (lambda x: vgrad(lambda x: (E(x) + p(x)) * v(x), x)[:, 2])(X)
 
         # equations
         eq1 = u1_t + f1_x + g1_y
@@ -115,45 +117,22 @@ class PINN:
     def loss_component(self, params, X_res, X_ic):
         # PDE residual
         eq1, eq2, eq3, eq4 = self.equation(params, X_res)
-        loss_eqn_mass, loss_eqn_momentum_x, loss_eqn_momentum_y, loss_eqn_energy = (
-            jnp.mean(eq1 ** 2),
-            jnp.mean(eq2 ** 2),
-            jnp.mean(eq3 ** 2),
-            jnp.mean(eq4 ** 2),
-        )
-        loss_eqn = (
-            loss_eqn_mass + loss_eqn_momentum_x + loss_eqn_momentum_y + loss_eqn_energy
-        )
+        loss_res = jnp.mean(eq1 ** 2 + eq2 ** 2 + eq3 ** 2 + eq4 ** 2)
         # initial condition
         x_ic, y_ic = X_ic[:, :3], X_ic[:, 3:]
-        ruvp_pred = self.forward(params, x_ic)
-        ruvp = y_ic
-        loss_ic = jnp.mean((ruvp_pred - ruvp) ** 2)
-        return loss_eqn, loss_ic
+        rho_pred, u_pred, v_pred, p_pred = self.forward(params, x_ic)
+        rho, u, v, p = y_ic[:, 0], y_ic[:, 1], y_ic[:, 2], y_ic[:, 3]
+        loss_ic = jnp.mean(
+            (rho - rho_pred) ** 2
+            + (u - u_pred) ** 2
+            + (v - v_pred) ** 2
+            + (p - p_pred) ** 2
+        )
+        return loss_res, loss_ic
 
     def loss(self, params, X_res, X_ic):
-        loss_eqn, loss_ic = self.loss_component(params, X_res, X_ic)
-        return self.weight_eqn * loss_eqn + self.weight_ic * loss_ic
-
-    @partial(jit, static_argnums=(0,))
-    def loss_evaluation(self, params, X_res, X_ic):
-        # PDE residual
-        eq1, eq2, eq3, eq4 = self.equation(params, X_res)
-        loss_eqn_mass, loss_eqn_momentum_x, loss_eqn_momentum_y, loss_eqn_energy = (
-            jnp.mean(eq1 ** 2),
-            jnp.mean(eq2 ** 2),
-            jnp.mean(eq3 ** 2),
-            jnp.mean(eq4 ** 2),
-        )
-        loss_eqn = (
-            loss_eqn_mass + loss_eqn_momentum_x + loss_eqn_momentum_y + loss_eqn_energy
-        )
-        # initial condition
-        x_ic, y_ic = X_ic[:, :3], X_ic[:, 3:]
-        ruvp_pred = self.forward(params, x_ic)
-        ruvp = y_ic
-        loss_ic = jnp.mean((ruvp_pred - ruvp) ** 2)
-        return loss_eqn, loss_ic
+        loss_res, loss_ic = self.loss_component(params, X_res, X_ic)
+        return self.weight_eqn * loss_res + self.weight_ic * loss_ic
 
     @partial(jit, static_argnums=(0,))
     def update(self, i, opt_state, X_res, X_ic):
@@ -161,45 +140,12 @@ class PINN:
         next_opt_state = self.opt_update(
             i, grad(self.loss)(params, X_res, X_ic), opt_state
         )
-        return next_opt_state
-
-    def train(self, X_res: np.ndarray, X_ic: np.ndarray):
-        """
-        loss_avg shape
-        [loss, loss_supervised, loss_eqn_momentum_x, loss_eqn_momentum_y, loss_eqn_mass, loss_bc]
-        """
-        N_residual = len(X_res)
-        N_ic = len(X_ic)
-        # batch data for residue constraint
-        res_batch_idx_list = mini_batch(N_residual, batch_size)
-        # batch data for initial condition
-        batch_num = len(res_batch_idx_list)
-        batch_size_ic = N_ic // batch_num + 1
-        ic_batch_idx_list = mini_batch(N_ic, batch_size_ic)
-        # loop through batches
-        loss_array = []
-        for ((_, res_idx), (_, ic_idx)) in zip(
-            enumerate(res_batch_idx_list),
-            enumerate(ic_batch_idx_list),
-        ):
-            # gather and convert data
-            X_res_batch = X_res[res_idx]
-            X_ic_batch = X_ic[ic_idx]
-            # train for a batch
-            self.params = self.get_params(self.opt_state)
-            self.opt_state = self.update(
-                next(self.global_step), self.opt_state, X_res_batch, X_ic_batch
-            )
-            loss_list = self.loss_evaluation(self.params, X_res_batch, X_ic_batch)
-            loss_array.append(loss_list)
-        loss_avg = np.mean(np.array(loss_array), axis=0)
-        self.log_loss.append(loss_avg)
-        return loss_avg
+        loss_res, loss_ic = self.loss_component(params, X_res, X_ic)
+        return next_opt_state, (loss_res, loss_ic)
 
     def save_result(self, X, meta_data, save_path):
         H, W = meta_data["H"], meta_data["W"]
-        ruvp = self.forward(self.params, X)
-        rho, u, v, p = ruvp[:, 0], ruvp[:, 1], ruvp[:, 2], ruvp[:, 3]
+        rho, u, v, p = self.forward(self.params, X)
         rho, u, v, p = (
             rho.reshape(H, W),
             u.reshape(H, W),
@@ -227,9 +173,9 @@ v_l, v_r = 0, 0
 p_l, p_r = 0.4, 0.4
 gamma = 1.4
 
-N_res = 1000
+N_res = 100000
 N_ic = 1000
-batch_size = 1000
+batch_size = 100000
 num_epochs = 20000
 
 num_layer = 4
@@ -287,19 +233,55 @@ X_final = np.stack((t, x, y), 1)
 model = PINN(layers, (lambda_eqn, lambda_ic), gamma)
 
 
-N_epochs = 20000
+def mini_batch(N: int, batch_size: int):
+    return np.split(
+        np.random.permutation(N),
+        np.arange(batch_size, N, batch_size),
+    )
+
+
+def train(model: PINN, X_res, X_ic):
+    """
+    loss_avg shape
+    [loss, loss_supervised, loss_eqn_momentum_x, loss_eqn_momentum_y, loss_eqn_mass, loss_bc]
+    """
+    N_residual = len(X_res)
+    N_ic = len(X_ic)
+    # batch data for residue constraint
+    res_batch_idx_list = mini_batch(N_residual, batch_size)
+    # batch data for initial condition
+    batch_num = len(res_batch_idx_list)
+    batch_size_ic = N_ic // batch_num + 1
+    ic_batch_idx_list = mini_batch(N_ic, batch_size_ic)
+    # loop through batches
+    loss_array = []
+    for ((_, res_idx), (_, ic_idx)) in zip(
+        enumerate(res_batch_idx_list),
+        enumerate(ic_batch_idx_list),
+    ):
+        # gather and convert data
+        X_res_batch = X_res[res_idx]
+        X_ic_batch = X_ic[ic_idx]
+        # train for a batch
+        model.opt_state, losses = model.update(
+            0, model.opt_state, X_res_batch, X_ic_batch
+        )
+        loss_array.append(losses)
+    loss_avg = np.mean(np.array(loss_array), axis=0)
+
+    return loss_avg
+
+
+N_epochs = 10000
 Y_result = []
 for epoch in range(1, N_epochs + 1):
     start = time.time()
-    losses = model.train(X_res, X_ic)
-    # if epoch ==2:
-    #     profile_result = cProfile.run("model.update(epoch, model.opt_state, X_res, X_ic)")
-    #     print(profile_result)
+    losses = train(model, X_res, X_ic)
+    model.params = model.get_params(model.opt_state)
     end = time.time()
-    # if epoch % 10 == 0 or epoch == 1:
-    loss_eqn, loss_ic = losses
-    print(
-        f"Epoch: {epoch:d}, time: {end-start:.3f}s, Loss_eqn = {loss_eqn:.3e}, Loss_ic = {loss_ic:.3e}"
-    )
-
-model.save_result(X_final, {"H": N_y, "W": N_x}, "./test/misc/result.h5")
+    if epoch % 10 == 0 or epoch == 1:
+        loss_res, loss_ic = losses
+        print(
+            f"Epoch: {epoch:d}, time: {end-start:.2f}s, Loss_eqn = {loss_res:.3e}, Loss_ic = {loss_ic:.3e}"
+        )
+model.save_result(X_final, {"H": N_y, "W": N_x}, "./test/result.h5")
